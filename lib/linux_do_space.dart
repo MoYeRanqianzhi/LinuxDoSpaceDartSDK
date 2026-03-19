@@ -90,7 +90,7 @@ class MailBox {
   late final String? address;
 
   final Future<void> Function() _unbind;
-  final StreamController<MailMessage> _controller = StreamController<MailMessage>.broadcast();
+  StreamController<MailMessage>? _controller;
   bool _closed = false;
   bool _activated = false;
   bool _listening = false;
@@ -104,9 +104,18 @@ class MailBox {
     if (_listening) {
       throw LinuxDoSpaceException("mailbox already has an active listener");
     }
+    final controller = StreamController<MailMessage>();
+    controller.onCancel = () {
+      if (identical(_controller, controller)) {
+        _controller = null;
+        _activated = false;
+        _listening = false;
+      }
+    };
+    _controller = controller;
     _activated = true;
     _listening = true;
-    return _controller.stream;
+    return controller.stream;
   }
 
   Future<void> close() async {
@@ -114,22 +123,26 @@ class MailBox {
       return;
     }
     _closed = true;
+    final controller = _controller;
+    _controller = null;
+    _activated = false;
+    _listening = false;
     await _unbind();
-    await _controller.close();
+    await controller?.close();
   }
 
   void _enqueue(MailMessage message) {
     if (_closed || !_activated) {
       return;
     }
-    _controller.add(message);
+    _controller?.add(message);
   }
 
   void _enqueueError(Object error) {
     if (_closed) {
       return;
     }
-    _controller.addError(error);
+    _controller?.addError(error);
   }
 }
 
