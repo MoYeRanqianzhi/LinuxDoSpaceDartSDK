@@ -195,9 +195,11 @@ class Client {
       throw ArgumentError("exactly one of prefix or pattern must be provided");
     }
     final normalizedSuffix = suffix.trim().toLowerCase();
-    final normalizedPrefix = hasPrefix ? prefix!.trim().toLowerCase() : null;
+    final prefixText = prefix?.trim();
+    final patternText = pattern?.trim();
+    final normalizedPrefix = hasPrefix ? prefixText!.toLowerCase() : null;
     final mode = hasPrefix ? "exact" : "pattern";
-    final regex = hasPattern ? RegExp("^${pattern!}\$") : null;
+    final regex = hasPattern ? RegExp("^${patternText!}\$") : null;
 
     late _Binding binding;
     final mailbox = MailBox(
@@ -205,7 +207,7 @@ class Client {
       suffix: normalizedSuffix,
       allowOverlap: allowOverlap,
       prefix: normalizedPrefix,
-      pattern: pattern,
+      pattern: patternText,
       unbind: () async {
         final chain = _bindingsBySuffix[normalizedSuffix];
         if (chain == null) {
@@ -236,6 +238,7 @@ class Client {
     }
     await _fullController.close();
     _http.close();
+    await _reader;
   }
 
   Future<void> _readLoop() async {
