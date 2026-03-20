@@ -5,6 +5,9 @@ import "dart:io" show HttpDate;
 import "package:http/http.dart" as http;
 
 class Suffix {
+  // linuxdoSpace is semantic rather than literal: SDK bindings resolve it to
+  // "<owner_username>.linuxdo.space" after the stream ready event provides
+  // owner_username.
   static const String linuxdoSpace = "linuxdo.space";
 }
 
@@ -194,6 +197,7 @@ class Client {
   final Map<String, List<_Binding>> _bindingsBySuffix = <String, List<_Binding>>{};
   bool _closed = false;
   LinuxDoSpaceException? _fatalError;
+  String? _ownerUsername;
   late final Future<void> _reader;
 
   Stream<MailMessage> listen() {
@@ -214,6 +218,9 @@ class Client {
       throw ArgumentError("exactly one of prefix or pattern must be provided");
     }
     final normalizedSuffix = suffix.trim().toLowerCase();
+    if (normalizedSuffix.isEmpty) {
+      throw ArgumentError("suffix must not be empty");
+    }
     final prefixText = prefix?.trim();
     final patternText = pattern?.trim();
     final normalizedPrefix = hasPrefix ? prefixText!.toLowerCase() : null;
@@ -314,7 +321,11 @@ class Client {
       throw StreamException("invalid NDJSON event payload");
     }
     final type = (decoded["type"] ?? "").toString();
-    if (type == "ready" || type == "heartbeat") {
+    if (type == "ready") {
+      _handleReady(decoded);
+      return;
+    }
+    if (type == "heartbeat") {
       return;
     }
     if (type != "mail") {
@@ -375,7 +386,13 @@ class Client {
     }
     final localPart = normalized.substring(0, at);
     final suffix = normalized.substring(at + 1);
-    final chain = _bindingsBySuffix[suffix] ?? const <_Binding>[];
+    List<_Binding> chain = _bindingsBySuffix[suffix] ?? const <_Binding>[];
+    if (chain.isEmpty && _ownerUsername != null) {
+      final semanticSuffix = "${_ownerUsername!}.${Suffix.linuxdoSpace}";
+      if (suffix == semanticSuffix) {
+        chain = _bindingsBySuffix[Suffix.linuxdoSpace] ?? const <_Binding>[];
+      }
+    }
     final matched = <_Binding>[];
     for (final binding in chain) {
       if (!binding.matches(localPart)) {
@@ -410,6 +427,14 @@ class Client {
     _bindingsBySuffix.clear();
     unawaited(_fullController.close());
     _http.close();
+  }
+
+  void _handleReady(Map<String, dynamic> payload) {
+    final ownerUsername = (payload["owner_username"] ?? "").toString().trim().toLowerCase();
+    if (ownerUsername.isEmpty) {
+      throw StreamException("ready event did not include owner_username");
+    }
+    _ownerUsername = ownerUsername;
   }
 
   void _ensureOperational() {
