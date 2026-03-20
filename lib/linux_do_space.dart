@@ -1,5 +1,6 @@
 import "dart:async";
 import "dart:convert";
+import "dart:io" show HttpDate;
 
 import "package:http/http.dart" as http;
 
@@ -192,9 +193,13 @@ class Client {
   final StreamController<MailMessage> _fullController = StreamController<MailMessage>.broadcast();
   final Map<String, List<_Binding>> _bindingsBySuffix = <String, List<_Binding>>{};
   bool _closed = false;
+  LinuxDoSpaceException? _fatalError;
   late final Future<void> _reader;
 
-  Stream<MailMessage> listen() => _fullController.stream;
+  Stream<MailMessage> listen() {
+    _ensureOperational();
+    return _fullController.stream;
+  }
 
   MailBox bind({
     String? prefix,
@@ -202,6 +207,7 @@ class Client {
     String suffix = Suffix.linuxdoSpace,
     bool allowOverlap = false,
   }) {
+    _ensureOperational();
     final hasPrefix = prefix != null && prefix.trim().isNotEmpty;
     final hasPattern = pattern != null && pattern.trim().isNotEmpty;
     if (hasPrefix == hasPattern) {
@@ -237,7 +243,10 @@ class Client {
     return mailbox;
   }
 
-  List<MailBox> route(MailMessage message) => _matchBindingsForAddress(message.address).map((item) => item.mailbox).toList(growable: false);
+  List<MailBox> route(MailMessage message) {
+    _ensureOperational();
+    return _matchBindingsForAddress(message.address).map((item) => item.mailbox).toList(growable: false);
+  }
 
   Future<void> close() async {
     if (_closed) {
@@ -260,7 +269,7 @@ class Client {
         await _consumeOnce();
       } catch (error) {
         if (error is AuthenticationException) {
-          _broadcastError(error);
+          _enterFatal(error);
           return;
         }
         _broadcastError(error);
@@ -324,39 +333,36 @@ class Client {
     final rawBase64 = (payload["raw_message_base64"] ?? "").toString().trim();
     final rawBytes = rawBase64.isEmpty ? <int>[] : base64Decode(rawBase64);
     final raw = utf8.decode(rawBytes, allowMalformed: true);
+    final parsed = _parseRawMessage(raw);
 
     final primary = recipients.isEmpty ? "" : recipients.first;
-    final message = MailMessage(
+    final fullMessage = _buildMailMessage(
+      parsed: parsed,
       address: primary,
       sender: sender,
       recipients: recipients,
       receivedAt: receivedAt,
-      subject: "",
-      messageId: null,
-      date: null,
-      fromHeader: "",
-      toHeader: "",
-      ccHeader: "",
-      replyToHeader: "",
-      fromAddresses: const <String>[],
-      toAddresses: const <String>[],
-      ccAddresses: const <String>[],
-      replyToAddresses: const <String>[],
-      text: raw,
-      html: "",
-      headers: const <String, String>{},
       raw: raw,
       rawBytes: rawBytes,
     );
-    _fullController.add(message);
+    _fullController.add(fullMessage);
 
     final seen = <String>{};
     for (final recipient in recipients) {
       if (!seen.add(recipient)) {
         continue;
       }
+      final recipientMessage = _buildMailMessage(
+        parsed: parsed,
+        address: recipient,
+        sender: sender,
+        recipients: recipients,
+        receivedAt: receivedAt,
+        raw: raw,
+        rawBytes: rawBytes,
+      );
       for (final binding in _matchBindingsForAddress(recipient)) {
-        binding.mailbox._enqueue(message);
+        binding.mailbox._enqueue(recipientMessage);
       }
     }
   }
@@ -391,6 +397,215 @@ class Client {
     }
   }
 
+  void _enterFatal(LinuxDoSpaceException fatal) {
+    if (_fatalError != null) {
+      return;
+    }
+    _fatalError = fatal;
+    _closed = true;
+    _broadcastError(fatal);
+    for (final mailbox in _bindingsBySuffix.values.expand((items) => items.map((item) => item.mailbox))) {
+      unawaited(mailbox.close());
+    }
+    _bindingsBySuffix.clear();
+    unawaited(_fullController.close());
+    _http.close();
+  }
+
+  void _ensureOperational() {
+    if (_fatalError != null) {
+      throw _fatalError!;
+    }
+    if (_closed) {
+      throw StreamException("client is already closed");
+    }
+  }
+
+  MailMessage _buildMailMessage({
+    required _ParsedMail parsed,
+    required String address,
+    required String sender,
+    required List<String> recipients,
+    required DateTime receivedAt,
+    required String raw,
+    required List<int> rawBytes,
+  }) {
+    return MailMessage(
+      address: address,
+      sender: sender,
+      recipients: recipients,
+      receivedAt: receivedAt,
+      subject: parsed.subject,
+      messageId: parsed.messageId,
+      date: parsed.date,
+      fromHeader: parsed.fromHeader,
+      toHeader: parsed.toHeader,
+      ccHeader: parsed.ccHeader,
+      replyToHeader: parsed.replyToHeader,
+      fromAddresses: parsed.fromAddresses,
+      toAddresses: parsed.toAddresses,
+      ccAddresses: parsed.ccAddresses,
+      replyToAddresses: parsed.replyToAddresses,
+      text: parsed.text,
+      html: parsed.html,
+      headers: parsed.headers,
+      raw: raw,
+      rawBytes: rawBytes,
+    );
+  }
+
+  _ParsedMail _parseRawMessage(String raw) {
+    final normalized = raw.replaceAll("\r\n", "\n");
+    final split = normalized.indexOf("\n\n");
+    final headerText = split >= 0 ? normalized.substring(0, split) : normalized;
+    final bodyText = split >= 0 ? normalized.substring(split + 2) : "";
+    final headers = _parseHeaders(headerText);
+    final contentType = headers["Content-Type"] ?? "";
+    final extracted = _extractBody(contentType, bodyText);
+
+    return _ParsedMail(
+      subject: headers["Subject"] ?? "",
+      messageId: _optionalHeader(headers, "Message-ID"),
+      date: _parseDate(_optionalHeader(headers, "Date")),
+      fromHeader: headers["From"] ?? "",
+      toHeader: headers["To"] ?? "",
+      ccHeader: headers["Cc"] ?? "",
+      replyToHeader: headers["Reply-To"] ?? "",
+      fromAddresses: _parseAddresses(headers["From"] ?? ""),
+      toAddresses: _parseAddresses(headers["To"] ?? ""),
+      ccAddresses: _parseAddresses(headers["Cc"] ?? ""),
+      replyToAddresses: _parseAddresses(headers["Reply-To"] ?? ""),
+      text: extracted.$1,
+      html: extracted.$2,
+      headers: headers,
+    );
+  }
+
+  Map<String, String> _parseHeaders(String source) {
+    final lines = source.split("\n");
+    final headers = <String, String>{};
+    String? activeKey;
+    for (final rawLine in lines) {
+      final line = rawLine;
+      if (line.isEmpty) {
+        continue;
+      }
+      if ((line.startsWith(" ") || line.startsWith("\t")) && activeKey != null) {
+        headers[activeKey!] = "${headers[activeKey!] ?? ""} ${line.trim()}";
+        continue;
+      }
+      final idx = line.indexOf(":");
+      if (idx <= 0) {
+        continue;
+      }
+      final key = line.substring(0, idx).trim();
+      final value = line.substring(idx + 1).trim();
+      headers[key] = value;
+      activeKey = key;
+    }
+    return headers;
+  }
+
+  (String, String) _extractBody(String contentType, String body) {
+    final loweredType = contentType.toLowerCase();
+    if (loweredType.contains("multipart/")) {
+      final boundary = _parseBoundary(contentType);
+      if (boundary != null) {
+        final delimiter = "--$boundary";
+        final endDelimiter = "--$boundary--";
+        final lines = body.replaceAll("\r\n", "\n").split("\n");
+        final textParts = <String>[];
+        final htmlParts = <String>[];
+        var collecting = false;
+        final current = <String>[];
+        void flushPart() {
+          if (current.isEmpty) return;
+          final part = current.join("\n");
+          current.clear();
+          final split = part.indexOf("\n\n");
+          final partHead = split >= 0 ? part.substring(0, split) : part;
+          final partBody = split >= 0 ? part.substring(split + 2) : "";
+          final headers = _parseHeaders(partHead);
+          final partType = (headers["Content-Type"] ?? "").toLowerCase();
+          if (partType.contains("text/plain")) {
+            textParts.add(partBody.trim());
+          } else if (partType.contains("text/html")) {
+            htmlParts.add(partBody.trim());
+          }
+        }
+
+        for (final line in lines) {
+          if (line == delimiter || line == endDelimiter) {
+            if (collecting) {
+              flushPart();
+            }
+            collecting = line != endDelimiter;
+            continue;
+          }
+          if (collecting) {
+            current.add(line);
+          }
+        }
+        return (textParts.join("\n"), htmlParts.join("\n"));
+      }
+    }
+
+    if (loweredType.contains("text/html")) {
+      return ("", body.trim());
+    }
+    return (body.trim(), "");
+  }
+
+  String? _parseBoundary(String contentType) {
+    final match = RegExp(r"boundary=([^;]+)", caseSensitive: false).firstMatch(contentType);
+    if (match == null) {
+      return null;
+    }
+    var value = match.group(1)!.trim();
+    if (value.startsWith("\"") && value.endsWith("\"") && value.length >= 2) {
+      value = value.substring(1, value.length - 1);
+    }
+    return value.isEmpty ? null : value;
+  }
+
+  String? _optionalHeader(Map<String, String> headers, String key) {
+    final value = headers[key]?.trim();
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    return value;
+  }
+
+  DateTime? _parseDate(String? value) {
+    if (value == null || value.isEmpty) {
+      return null;
+    }
+    final iso = DateTime.tryParse(value);
+    if (iso != null) {
+      return iso;
+    }
+    try {
+      return HttpDate.parse(value);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  List<String> _parseAddresses(String source) {
+    if (source.trim().isEmpty) {
+      return const <String>[];
+    }
+    return source.split(",").map((chunk) {
+      final trimmed = chunk.trim();
+      final left = trimmed.indexOf("<");
+      final right = trimmed.indexOf(">");
+      final candidate = (left >= 0 && right > left)
+          ? trimmed.substring(left + 1, right).trim().toLowerCase()
+          : trimmed.toLowerCase();
+      return candidate;
+    }).where((item) => item.contains("@")).toList(growable: false);
+  }
+
   static Uri _normalizeBaseUrl(String value) {
     final normalized = value.trim().replaceFirst(RegExp(r"/+$"), "");
     if (normalized.isEmpty) {
@@ -412,4 +627,38 @@ class Client {
     }
     return uri;
   }
+}
+
+class _ParsedMail {
+  _ParsedMail({
+    required this.subject,
+    required this.messageId,
+    required this.date,
+    required this.fromHeader,
+    required this.toHeader,
+    required this.ccHeader,
+    required this.replyToHeader,
+    required this.fromAddresses,
+    required this.toAddresses,
+    required this.ccAddresses,
+    required this.replyToAddresses,
+    required this.text,
+    required this.html,
+    required this.headers,
+  });
+
+  final String subject;
+  final String? messageId;
+  final DateTime? date;
+  final String fromHeader;
+  final String toHeader;
+  final String ccHeader;
+  final String replyToHeader;
+  final List<String> fromAddresses;
+  final List<String> toAddresses;
+  final List<String> ccAddresses;
+  final List<String> replyToAddresses;
+  final String text;
+  final String html;
+  final Map<String, String> headers;
 }

@@ -5,10 +5,12 @@ This directory contains a Dart SDK implementation for LinuxDoSpace mail stream p
 ## Scope
 
 - `Client`, `Suffix`, `MailMessage`
-- Errors: auth and stream errors
+- Errors: auth and stream errors (auth fatal is persisted)
 - Full token listener stream
 - Local binding (exact/regex), ordered matching, allow overlap
 - `route`, `close`
+- Multi-recipient dispatch keeps mailbox `message.address` as current recipient
+- MIME header/body parsing fills common fields (`subject`, address headers, text/html)
 
 ## Local Verification Status
 
