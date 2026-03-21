@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinuxDoSpace Dart SDK"
+  short_description: "Use or maintain the LinuxDoSpace Dart SDK"
+  default_prompt: "Use $linuxdo-space-dart-sdk when writing consumer code against sdk/dart or when updating the LinuxDoSpace Dart SDK with matching docs and validation guidance."
