@@ -516,7 +516,8 @@ class Client {
         continue;
       }
       if ((line.startsWith(" ") || line.startsWith("\t")) && activeKey != null) {
-        headers[activeKey!] = "${headers[activeKey!] ?? ""} ${line.trim()}";
+        final currentKey = activeKey;
+        headers[currentKey] = "${headers[currentKey] ?? ""} ${line.trim()}";
         continue;
       }
       final idx = line.indexOf(":");
