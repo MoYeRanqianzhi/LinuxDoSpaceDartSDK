@@ -27,4 +27,3 @@ dart analyze
 - `../../../README.md`
 - `../../../.github/workflows/ci.yml`
 - `../../../.github/workflows/release.yml`
-

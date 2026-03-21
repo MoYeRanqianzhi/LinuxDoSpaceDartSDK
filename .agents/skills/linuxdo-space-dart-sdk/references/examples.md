@@ -21,4 +21,3 @@ final catchAll = client.bind(
 ```dart
 final targets = client.route(message);
 ```
-

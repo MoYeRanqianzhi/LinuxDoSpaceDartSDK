@@ -32,4 +32,3 @@ Read [references/development.md](references/development.md) only when editing `s
 - Do not document pub.dev publication; current release path is tag-pinned git or GitHub Release source archive.
 - Do not describe `listen()` as taking a timeout parameter; Dart uses stream APIs plus constructor timeouts.
 - Do not add hidden pre-listen mailbox buffering.
-

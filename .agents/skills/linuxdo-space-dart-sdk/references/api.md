@@ -27,4 +27,3 @@
 - `bind(...)` requires exactly one of `prefix` or `pattern`.
 - Regex bindings use full-match semantics.
 - `Suffix.linuxdoSpace` is semantic, not literal.
-

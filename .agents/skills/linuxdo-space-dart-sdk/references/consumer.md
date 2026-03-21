@@ -50,4 +50,3 @@ try {
 - `route(message)` matches only `message.address`.
 - Full-stream messages use a primary projection address.
 - Mailbox messages use matched-recipient projection addresses.
-
