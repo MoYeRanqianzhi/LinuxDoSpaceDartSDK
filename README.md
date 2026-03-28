@@ -15,7 +15,16 @@ This directory contains a Dart SDK implementation for LinuxDoSpace mail stream p
 Important:
 
 - `Suffix.linuxdoSpace` is semantic, not literal
-- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
+- `Suffix.linuxdoSpace` now resolves to the current token owner's canonical
+  mail namespace: `<owner_username>-mail.linuxdo.space`
+- `Suffix.withSuffix("foo")` resolves to
+  `<owner_username>-mailfoo.linuxdo.space`
+- active semantic `-mail<suffix>` registrations are synchronized to
+  `PUT /v1/token/email/filters`
+- the legacy default alias `<owner_username>.linuxdo.space` still matches the
+  default semantic binding automatically
+- consumer code should keep using `Suffix.linuxdoSpace` instead of hardcoding
+  a concrete `*-mail.linuxdo.space` namespace
 
 ## Local Verification Status
 

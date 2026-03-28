@@ -6,9 +6,58 @@ import "package:http/http.dart" as http;
 
 class Suffix {
   // linuxdoSpace is semantic rather than literal: SDK bindings resolve it to
-  // "<owner_username>.linuxdo.space" after the stream ready event provides
-  // owner_username.
+  // the current token owner's canonical `@<owner>-mail.linuxdo.space`
+  // namespace after the stream ready event provides owner_username.
   static const String linuxdoSpace = "linuxdo.space";
+
+  static SemanticSuffix withSuffix(String fragment) {
+    return SemanticSuffix(linuxdoSpace, fragment);
+  }
+}
+
+class SemanticSuffix {
+  SemanticSuffix(this.base, String fragment) : mailSuffixFragment = _normalize(fragment);
+
+  final String base;
+  final String mailSuffixFragment;
+
+  SemanticSuffix withSuffix(String fragment) => SemanticSuffix(base, fragment);
+
+  static String _normalize(String raw) {
+    final value = raw.trim().toLowerCase();
+    if (value.isEmpty) {
+      return "";
+    }
+
+    final buffer = StringBuffer();
+    var lastWasDash = false;
+    for (final character in value.runes) {
+      final stringValue = String.fromCharCode(character);
+      final isAlpha = character >= 97 && character <= 122;
+      final isDigit = character >= 48 && character <= 57;
+      if (isAlpha || isDigit) {
+        buffer.write(stringValue);
+        lastWasDash = false;
+        continue;
+      }
+      if (!lastWasDash) {
+        buffer.write("-");
+        lastWasDash = true;
+      }
+    }
+
+    final normalized = buffer.toString().replaceAll(RegExp(r"^-+|-+$"), "");
+    if (normalized.isEmpty) {
+      throw ArgumentError("mail suffix fragment does not contain any valid dns characters");
+    }
+    if (normalized.contains(".")) {
+      throw ArgumentError("mail suffix fragment must stay inside one dns label");
+    }
+    if (normalized.length > 48) {
+      throw ArgumentError("mail suffix fragment must be 48 characters or fewer");
+    }
+    return normalized;
+  }
 }
 
 class LinuxDoSpaceException implements Exception {
@@ -198,6 +247,8 @@ class Client {
   bool _closed = false;
   LinuxDoSpaceException? _fatalError;
   String? _ownerUsername;
+  List<String>? _syncedMailboxSuffixFragments;
+  Future<void> _mailboxFilterSyncChain = Future<void>.value();
   late final Future<void> _reader;
 
   Stream<MailMessage> listen() {
@@ -208,7 +259,7 @@ class Client {
   MailBox bind({
     String? prefix,
     String? pattern,
-    String suffix = Suffix.linuxdoSpace,
+    Object suffix = Suffix.linuxdoSpace,
     bool allowOverlap = false,
   }) {
     _ensureOperational();
@@ -217,7 +268,7 @@ class Client {
     if (hasPrefix == hasPattern) {
       throw ArgumentError("exactly one of prefix or pattern must be provided");
     }
-    final normalizedSuffix = suffix.trim().toLowerCase();
+    final normalizedSuffix = _resolveBindingSuffixInput(suffix);
     if (normalizedSuffix.isEmpty) {
       throw ArgumentError("suffix must not be empty");
     }
@@ -243,10 +294,12 @@ class Client {
         if (chain.isEmpty) {
           _bindingsBySuffix.remove(normalizedSuffix);
         }
+        _queueMailboxFilterSync(strict: false);
       },
     );
     binding = _Binding(mode: mode, suffix: normalizedSuffix, allowOverlap: allowOverlap, prefix: normalizedPrefix, pattern: regex, mailbox: mailbox);
     _bindingsBySuffix.putIfAbsent(normalizedSuffix, () => <_Binding>[]).add(binding);
+    _queueMailboxFilterSync(strict: true);
     return mailbox;
   }
 
@@ -389,8 +442,9 @@ class Client {
     List<_Binding> chain = _bindingsBySuffix[suffix] ?? const <_Binding>[];
     if (chain.isEmpty && _ownerUsername != null) {
       final semanticSuffix = "${_ownerUsername!}.${Suffix.linuxdoSpace}";
+      final semanticMailSuffix = "${_ownerUsername!}-mail.${Suffix.linuxdoSpace}";
       if (suffix == semanticSuffix) {
-        chain = _bindingsBySuffix[Suffix.linuxdoSpace] ?? const <_Binding>[];
+        chain = _bindingsBySuffix[semanticMailSuffix] ?? const <_Binding>[];
       }
     }
     final matched = <_Binding>[];
@@ -435,6 +489,129 @@ class Client {
       throw StreamException("ready event did not include owner_username");
     }
     _ownerUsername = ownerUsername;
+    _queueMailboxFilterSync(strict: true);
+  }
+
+  String _resolveBindingSuffixInput(Object suffix) {
+    if (suffix is SemanticSuffix) {
+      final base = suffix.base.trim().toLowerCase();
+      if (base != Suffix.linuxdoSpace) {
+        if (base.isEmpty) {
+          throw ArgumentError("suffix must not be empty");
+        }
+        return base;
+      }
+
+      final ownerUsername = (_ownerUsername ?? "").trim().toLowerCase();
+      if (ownerUsername.isEmpty) {
+        if (suffix.mailSuffixFragment.isEmpty) {
+          throw StreamException("stream bootstrap did not provide owner_username required to resolve Suffix.linuxdoSpace");
+        }
+        throw StreamException("stream bootstrap did not provide owner_username required to resolve Suffix.withSuffix(...)");
+      }
+      return "$ownerUsername-mail${suffix.mailSuffixFragment}.$base";
+    }
+
+    final normalizedSuffix = suffix.toString().trim().toLowerCase();
+    if (normalizedSuffix.isEmpty) {
+      throw ArgumentError("suffix must not be empty");
+    }
+    if (normalizedSuffix != Suffix.linuxdoSpace) {
+      return normalizedSuffix;
+    }
+
+    final ownerUsername = (_ownerUsername ?? "").trim().toLowerCase();
+    if (ownerUsername.isEmpty) {
+      throw StreamException("stream bootstrap did not provide owner_username required to resolve Suffix.linuxdoSpace");
+    }
+    return "$ownerUsername-mail.$normalizedSuffix";
+  }
+
+  void _queueMailboxFilterSync({required bool strict}) {
+    _mailboxFilterSyncChain = _mailboxFilterSyncChain.catchError((_) {}).then((_) async {
+      try {
+        await _syncRemoteMailboxFilters(strict: strict);
+      } catch (error) {
+        if (!strict) {
+          return;
+        }
+        final failure = error is LinuxDoSpaceException
+            ? error
+            : StreamException("failed to synchronize remote mailbox filters", error);
+        _enterFatal(failure);
+      }
+    });
+  }
+
+  Future<void> _syncRemoteMailboxFilters({required bool strict}) async {
+    if (_closed) {
+      return;
+    }
+    final ownerUsername = (_ownerUsername ?? "").trim().toLowerCase();
+    if (ownerUsername.isEmpty) {
+      return;
+    }
+
+    final fragments = _collectRemoteMailboxSuffixFragments(ownerUsername);
+    if (fragments.isEmpty && _syncedMailboxSuffixFragments == null) {
+      return;
+    }
+    final synced = _syncedMailboxSuffixFragments;
+    if (synced != null && _listEquals(synced, fragments)) {
+      return;
+    }
+
+    final response = await _http
+        .put(
+          _baseUrl.resolve("/v1/token/email/filters"),
+          headers: <String, String>{
+            "Authorization": "Bearer $_token",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+          },
+          body: jsonEncode(<String, Object>{"suffixes": fragments}),
+        )
+        .timeout(_connectTimeout);
+
+    if (response.statusCode < 200 || response.statusCode > 299) {
+      if (strict) {
+        throw StreamException("unexpected mailbox filter sync status code: ${response.statusCode}");
+      }
+      return;
+    }
+
+    _syncedMailboxSuffixFragments = fragments;
+  }
+
+  List<String> _collectRemoteMailboxSuffixFragments(String ownerUsername) {
+    final canonicalPrefix = "$ownerUsername-mail";
+    final rootSuffix = ".${Suffix.linuxdoSpace}";
+    final fragments = <String>{};
+    for (final suffix in _bindingsBySuffix.keys) {
+      final normalizedSuffix = suffix.trim().toLowerCase();
+      if (!normalizedSuffix.endsWith(rootSuffix)) {
+        continue;
+      }
+      final label = normalizedSuffix.substring(0, normalizedSuffix.length - rootSuffix.length);
+      if (label.contains(".") || !label.startsWith(canonicalPrefix)) {
+        continue;
+      }
+      fragments.add(label.substring(canonicalPrefix.length));
+    }
+    final sorted = fragments.toList(growable: false)..sort();
+    return sorted;
+  }
+
+  bool _listEquals(List<String> left, List<String> right) {
+    if (left.length != right.length) {
+      return false;
+    }
+    for (var index = 0; index < left.length; index += 1) {
+      if (left[index] != right[index]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void _ensureOperational() {
